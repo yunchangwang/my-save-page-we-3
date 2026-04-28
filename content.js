@@ -167,6 +167,7 @@ var loadLazyContent,lazyLoadType,loadLazyImages,retainCrossFrames,mergeCSSImages
 var saveHTMLAudioVideo,saveHTMLObjectEmbed,saveHTMLImagesAll;
 var saveCSSImagesAll,saveCSSFontsWoff,saveCSSFontsAll,saveScripts;
 var savedFileName,replaceSpaces,replaceChar,maxFileNameLength;
+var buttonActionItems;
 var saveDelayTime;
 var lazyLoadScrollTime,lazyLoadShrinkTime;
 var maxFrameDepth;
@@ -234,6 +235,28 @@ var hrefSVGElements = ["a","altGlyph","animate","animateColor","animateMotion","
 
 var debugEnable = false;
 
+/* Minimal observer for testing auto-capture trigger filtering */
+
+var testObserverEnable = true;
+var testObserverQuietTime = 1500;
+var testObserver = null;
+var testObserverCaptureActive = false;
+var testObserverCaptureCooldown = false;
+var testObserverCooldownTimer = null;
+var testObserverPendingTimer = null;
+var testObserverPendingCount = 0;
+var testObserverPendingMutations = [];
+var testObserverPendingStarted = 0;
+var autoCaptureListening = false;
+var autoCaptureStopAfterCurrent = false;
+var autoCaptureSequence = 0;
+var autoCaptureStorageFull = false;
+var autoCaptureStorageFullNotified = false;
+var autoCaptureLastSignature = "";
+var autoCaptureGuardEvents = ["click","mousedown","mouseup","pointerdown","pointerup","touchstart","touchend","keydown","submit","wheel"];
+var autoCaptureGuardActive = false;
+var saveOperationMode = "download";
+
 /************************************************************************/
 
 /* Initialize on script load */
@@ -281,6 +304,7 @@ function(local)
     saveScripts = local["options-savescripts"];
     
     savedFileName = local["options-savedfilename"];
+    buttonActionItems = local["options-buttonactionitems"];
     replaceSpaces = local["options-replacespaces"];
     replaceChar = local["options-replacechar"];
     maxFileNameLength = local["options-maxfilenamelength"];
@@ -354,8 +378,472 @@ function(local)
         saveState = -1;
         
         chrome.runtime.sendMessage({ type: "scriptLoaded", pagetype: pageType, savestate: saveState });
+        
+        startTestObserver();
     });
 });
+
+/************************************************************************/
+
+function startTestObserver()
+{
+    if (!testObserverEnable || testObserver != null) return;
+    
+    testObserver = new MutationObserver(handleTestObserverMutations);
+    
+    testObserver.observe(document.documentElement,
+    {
+        attributes: true,
+        childList: true,
+        subtree: true,
+        attributeOldValue: false
+    });
+    
+    console.log("[SavePage TestObserver] started");
+}
+
+function handleTestObserverMutations(mutations)
+{
+    var i,effectiveMutations = [];
+    
+    if (!autoCaptureListening) return;
+    
+    if (testObserverCaptureActive || testObserverCaptureCooldown)
+    {
+        console.log("[SavePage TestObserver] skip: capturing",mutations.length);
+        return;
+    }
+    
+    for (i = 0; i < mutations.length; i++)
+    {
+        if (!ignoreTestObserverMutation(mutations[i])) effectiveMutations.push(mutations[i]);
+    }
+    
+    if (effectiveMutations.length == 0)
+    {
+        console.log("[SavePage TestObserver] skip: savepage-only mutations",mutations.length);
+        return;
+    }
+    
+    if (testObserverPendingTimer == null) testObserverPendingStarted = Date.now();
+    
+    testObserverPendingCount += effectiveMutations.length;
+    
+    for (i = 0; i < effectiveMutations.length && testObserverPendingMutations.length < 5; i++)
+        testObserverPendingMutations.push(describeTestObserverMutation(effectiveMutations[i]));
+    
+    if (testObserverPendingTimer != null) window.clearTimeout(testObserverPendingTimer);
+    
+    testObserverPendingTimer = window.setTimeout(flushTestObserverPending,testObserverQuietTime);
+}
+
+function flushTestObserverPending()
+{
+    var elapsed;
+    
+    testObserverPendingTimer = null;
+    
+    if (testObserverPendingCount == 0) return;
+    
+    elapsed = Date.now()-testObserverPendingStarted;
+    
+    console.log("[SavePage TestObserver] trigger capture",{
+        mutations: testObserverPendingCount,
+        quietTime: testObserverQuietTime,
+        elapsed: elapsed,
+        samples: testObserverPendingMutations
+    });
+    
+    triggerTestObserverCapture();
+    
+    testObserverPendingCount = 0;
+    testObserverPendingMutations.length = 0;
+    testObserverPendingStarted = 0;
+}
+
+function resetTestObserverPending()
+{
+    if (testObserverPendingTimer != null)
+    {
+        window.clearTimeout(testObserverPendingTimer);
+        testObserverPendingTimer = null;
+    }
+    
+    testObserverPendingCount = 0;
+    testObserverPendingMutations.length = 0;
+    testObserverPendingStarted = 0;
+}
+
+function setTestObserverCaptureActive(active,reason)
+{
+    if (!testObserverEnable) return;
+    
+    if (active)
+    {
+        testObserverCaptureActive = true;
+        testObserverCaptureCooldown = false;
+        
+        if (testObserverCooldownTimer != null)
+        {
+            window.clearTimeout(testObserverCooldownTimer);
+            testObserverCooldownTimer = null;
+        }
+        
+        resetTestObserverPending();
+        
+        console.log("[SavePage TestObserver] capture on",reason);
+    }
+    else
+    {
+        testObserverCaptureActive = false;
+        testObserverCaptureCooldown = true;
+        
+        if (testObserverCooldownTimer != null) window.clearTimeout(testObserverCooldownTimer);
+        
+        testObserverCooldownTimer = window.setTimeout(
+        function()
+        {
+            testObserverCooldownTimer = null;
+            testObserverCaptureCooldown = false;
+            console.log("[SavePage TestObserver] capture off",reason);
+        },testObserverQuietTime);
+    }
+}
+
+function triggerTestObserverCapture()
+{
+    if (!autoCaptureListening || pageType >= 2 || (saveState >= 0 && saveState <= 5)) return;
+    
+    setTestObserverCaptureActive(true,"observer-trigger");
+    beginBufferedCapture();
+}
+
+function startBufferedCaptureAndSave()
+{
+    resetTestObserverPending();
+    setTestObserverCaptureActive(true,"observer-stop");
+    beginBufferedCapture();
+}
+
+function ignoreTestObserverMutation(mutation)
+{
+    var i,node,target;
+    
+    target = mutation.target;
+    
+    if (target instanceof Element)
+    {
+        if (target.id == "savepage-download-iframe") return true;
+        if (target.id.substr(0,9) == "savepage-") return true;
+        if (target.closest("[id^='savepage-']") != null) return true;
+        
+        if (mutation.type == "attributes")
+        {
+            if (mutation.attributeName != null && mutation.attributeName.substr(0,14) == "data-savepage-") return true;
+            if (mutation.attributeName == "style" && (target == document.documentElement || target == document.body)) return true;
+        }
+    }
+    
+    for (i = 0; i < mutation.addedNodes.length; i++)
+    {
+        node = mutation.addedNodes[i];
+        
+        if (node instanceof Element)
+        {
+            if (node.id == "savepage-download-iframe") return true;
+            if (node.id.substr(0,9) == "savepage-") return true;
+            if (node.querySelector("[id^='savepage-']") != null) return true;
+        }
+    }
+    
+    return false;
+}
+
+function describeTestObserverMutation(mutation)
+{
+    var node,target;
+    var nodes = [];
+    
+    target = mutation.target;
+    
+    if (mutation.type == "attributes")
+    {
+        return "attr " + mutation.attributeName + " on " + getTestObserverNodeLabel(target);
+    }
+    
+    for (node of mutation.addedNodes) nodes.push(getTestObserverNodeLabel(node));
+    
+    return "childList on " + getTestObserverNodeLabel(target) + (nodes.length > 0 ? " added " + nodes.join(", ") : "");
+}
+
+function getTestObserverNodeLabel(node)
+{
+    if (!(node instanceof Element)) return String(node && node.nodeName ? node.nodeName : "node");
+    
+    return node.localName +
+           (node.id ? "#" + node.id : "") +
+           (node.classList.length > 0 ? "." + Array.from(node.classList).slice(0,2).join(".") : "");
+}
+
+/************************************************************************/
+
+function notifySaveExit()
+{
+    hideAutoCaptureGuard();
+    setTestObserverCaptureActive(false,"saveExit");
+    chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+}
+
+function notifySaveDone(success)
+{
+    hideAutoCaptureGuard();
+    setTestObserverCaptureActive(false,"saveDone");
+    chrome.runtime.sendMessage({ type: "saveDone", success: success, pagetype: pageType, savestate: saveState });
+}
+
+/************************************************************************/
+
+function beginBufferedCapture()
+{
+    if (autoCaptureStorageFull)
+    {
+        setTestObserverCaptureActive(false,"bufferedCaptureStorageFull");
+        return;
+    }
+    
+    menuAction = 0;
+    savedItems = buttonActionItems;
+    toggleLazy = false;
+    multipleSaves = false;
+    cspRestriction = false;
+    cancelSave = false;
+    saveOperationMode = "buffer";
+    showAutoCaptureGuard();
+    
+    initializeBeforeSave();
+}
+
+function finishBufferedCapture()
+{
+    hideAutoCaptureGuard();
+    saveOperationMode = "download";
+    saveState = -1;
+    
+    chrome.runtime.sendMessage({ type: "stateChanged", pagetype: pageType, savestate: saveState });
+    
+    if (autoCaptureStopAfterCurrent)
+    {
+        autoCaptureStopAfterCurrent = false;
+        setTestObserverCaptureActive(false,"bufferedCaptureStopped");
+    }
+    else setTestObserverCaptureActive(false,"bufferedCapture");
+}
+
+function storeBufferedCapture(htmltext,filename,pageurl)
+{
+    var timestamp,sequence,signature;
+    
+    timestamp = Date.now();
+    sequence = ++autoCaptureSequence;
+    signature = htmltext.length + ":" + hashAutoCaptureString(htmltext);
+    
+    if (autoCaptureLastSignature == signature)
+    {
+        finishBufferedCapture();
+        return;
+    }
+    
+    chrome.runtime.sendMessage({ type: "storeAutoCaptureSnapshot",
+                                 tabid: -1,
+                                 html: htmltext,
+                                 filename: createSnapshotFileName(filename,timestamp,sequence),
+                                 url: pageurl,
+                                 title: document.title,
+                                 capturedat: timestamp,
+                                 sequence: sequence,
+                                 signature: signature },
+    function(response)
+    {
+        if (response && response.stored)
+        {
+            autoCaptureLastSignature = signature;
+        }
+        else if (response && response.reason == "limit")
+        {
+            autoCaptureStorageFull = true;
+            autoCaptureListening = false;
+            notifyAutoCaptureStorageFull(response.limitbytes);
+        }
+        
+        finishBufferedCapture();
+    });
+}
+
+function clearBufferedCapture()
+{
+    autoCaptureLastSignature = "";
+}
+
+function showAutoCaptureGuard()
+{
+    var container,overlay,text;
+    
+    if (autoCaptureGuardActive) return;
+    
+    autoCaptureGuardActive = true;
+    
+    container = document.createElement("div");
+    container.id = "savepage-capture-guard-container";
+    container.setAttribute("data-savepage-transient","");
+    container.style.setProperty("all","initial","important");
+    container.style.setProperty("position","fixed","important");
+    container.style.setProperty("inset","0","important");
+    container.style.setProperty("z-index","2147483647","important");
+    container.style.setProperty("background","rgba(15,23,42,0.22)","important");
+    container.style.setProperty("display","flex","important");
+    container.style.setProperty("align-items","center","important");
+    container.style.setProperty("justify-content","center","important");
+    container.style.setProperty("pointer-events","auto","important");
+    
+    overlay = document.createElement("div");
+    overlay.setAttribute("data-savepage-transient","");
+    overlay.style.setProperty("background","#ffffff","important");
+    overlay.style.setProperty("color","#111827","important");
+    overlay.style.setProperty("padding","18px 22px","important");
+    overlay.style.setProperty("border-radius","12px","important");
+    overlay.style.setProperty("box-shadow","0 12px 40px rgba(0,0,0,0.18)","important");
+    overlay.style.setProperty("font","600 15px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif","important");
+    overlay.style.setProperty("max-width","320px","important");
+    overlay.style.setProperty("text-align","center","important");
+    
+    text = document.createElement("div");
+    text.setAttribute("data-savepage-transient","");
+    text.textContent = "正在抓取页面，请稍候...";
+    
+    overlay.appendChild(text);
+    container.appendChild(overlay);
+    document.documentElement.appendChild(container);
+    
+    for (text of autoCaptureGuardEvents)
+        window.addEventListener(text,handleAutoCaptureGuardEvent,true);
+}
+
+function hideAutoCaptureGuard()
+{
+    var eventName,container;
+    
+    if (!autoCaptureGuardActive) return;
+    
+    autoCaptureGuardActive = false;
+    
+    for (eventName of autoCaptureGuardEvents)
+        window.removeEventListener(eventName,handleAutoCaptureGuardEvent,true);
+    
+    container = document.getElementById("savepage-capture-guard-container");
+    
+    if (container != null && container.parentNode != null) container.parentNode.removeChild(container);
+}
+
+function handleAutoCaptureGuardEvent(event)
+{
+    if (!autoCaptureGuardActive) return;
+    
+    event.preventDefault();
+    event.stopImmediatePropagation();
+}
+
+function isTransientSavePageElement(element)
+{
+    return !!(element &&
+              element.nodeType == 1 &&
+              ((element.id && element.id.substr(0,9) == "savepage-") ||
+               element.hasAttribute("data-savepage-transient")));
+}
+
+function notifyAutoCaptureStorageFull(limitbytes)
+{
+    var limitmb;
+    
+    if (autoCaptureStorageFullNotified) return;
+    
+    autoCaptureStorageFullNotified = true;
+    limitmb = Math.round((limitbytes || 0)/(1024*1024));
+    
+    showMessage("自动抓取已暂停","自动抓取","自动抓取缓存已达到当前设置上限" +
+                (limitmb > 0 ? "（" + limitmb + " MB）。" : "。") +
+                "\n\n请在“自动抓取控制台”中点击“停止监听并保存”后再继续。",null,
+    function() {});
+}
+
+function createSnapshotFileName(filename,timestamp,sequence)
+{
+    var index,basename,extension,date;
+    
+    index = filename.lastIndexOf(".");
+    
+    if (index >= 0)
+    {
+        basename = filename.substr(0,index);
+        extension = filename.substr(index);
+    }
+    else
+    {
+        basename = filename;
+        extension = ".html";
+    }
+    
+    date = new Date(timestamp);
+    
+    filename = basename + "-" +
+               date.getFullYear() +
+               padNumber(date.getMonth()+1,2) +
+               padNumber(date.getDate(),2) + "-" +
+               padNumber(date.getHours(),2) +
+               padNumber(date.getMinutes(),2) +
+               padNumber(date.getSeconds(),2) + "-" +
+               padNumber(sequence,4) +
+               extension;
+    
+    return filename;
+}
+
+function padNumber(value,length)
+{
+    return ("0000" + value).substr(-length);
+}
+
+function hashAutoCaptureString(text)
+{
+    var i,hash;
+    
+    hash = 2166136261;
+    
+    for (i = 0; i < text.length; i++)
+    {
+        hash ^= text.charCodeAt(i);
+        hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+    }
+    
+    return (hash >>> 0).toString(16);
+}
+
+function transferHtmlToDownload(htmltext,filename)
+{
+    var i,htmlindex,htmlstring;
+    
+    htmlindex = 0;
+    
+    for (i = 0; i < htmltext.length; i += 1024*1024)
+    {
+        htmlstring = htmltext.substr(i,1024*1024);
+        
+        chrome.runtime.sendMessage({ type: "transferString", htmlstring: htmlstring, htmlindex: htmlindex });
+        
+        htmlindex++;
+    }
+    
+    chrome.runtime.sendMessage({ type: "savePage", filename: filename });
+}
 
 /************************************************************************/
 
@@ -396,6 +884,7 @@ function addListeners()
         if ("options-savescripts" in changes) saveScripts = changes["options-savescripts"].newValue;
         
         if ("options-savedfilename" in changes) savedFileName = changes["options-savedfilename"].newValue;
+        if ("options-buttonactionitems" in changes) buttonActionItems = changes["options-buttonactionitems"].newValue;
         if ("options-replacespaces" in changes) replaceSpaces = changes["options-replacespaces"].newValue;
         if ("options-replacechar" in changes) replaceChar = changes["options-replacechar"].newValue;
         if ("options-maxfilenamelength" in changes) maxFileNameLength = changes["options-maxfilenamelength"].newValue;
@@ -435,6 +924,63 @@ function addListeners()
                 
                 break;
                 
+            case "getAutoCaptureState":
+                
+                sendResponse({ listening: autoCaptureListening,
+                               hasbuffer: false,
+                               snapshotcount: 0,
+                               filename: "",
+                               capturedat: 0,
+                               storagefull: autoCaptureStorageFull,
+                               capturing: (testObserverCaptureActive || testObserverCaptureCooldown) });
+                
+                break;
+                
+            case "startAutoCapture":
+                
+                startTestObserver();
+                autoCaptureListening = true;
+                autoCaptureStopAfterCurrent = false;
+                autoCaptureStorageFull = false;
+                autoCaptureStorageFullNotified = false;
+                clearBufferedCapture();
+                
+                sendResponse({ listening: autoCaptureListening, hasbuffer: false, snapshotcount: 0, storagefull: autoCaptureStorageFull });
+                
+                break;
+                
+            case "stopAutoCapture":
+                
+                autoCaptureListening = false;
+                
+                if (saveOperationMode == "buffer" && saveState >= 0 && saveState <= 5)
+                {
+                    autoCaptureStopAfterCurrent = true;
+                    sendResponse({ stopped: true, pending: true, hasbuffer: false, snapshotcount: 0 });
+                }
+                else if (testObserverPendingCount > 0)
+                {
+                    autoCaptureStopAfterCurrent = true;
+                    startBufferedCaptureAndSave();
+                    sendResponse({ stopped: true, pending: true, hasbuffer: false, snapshotcount: 0 });
+                }
+                else
+                {
+                    sendResponse({ stopped: true, pending: false, hasbuffer: false, snapshotcount: 0 });
+                }
+                
+                break;
+                
+            case "resetAutoCaptureStorageState":
+                
+                autoCaptureStorageFull = false;
+                autoCaptureStorageFullNotified = false;
+                clearBufferedCapture();
+                
+                sendResponse({ reset: true, storagefull: autoCaptureStorageFull });
+                
+                break;
+                
             case "performAction":
                 
                 menuAction = message.menuaction;
@@ -457,7 +1003,7 @@ function addListeners()
                     {
                         saveState = -1;
                         
-                        if (menuAction <= 1) chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                        if (menuAction <= 1) notifySaveExit();
                         else chrome.runtime.sendMessage({ type: "stateChanged", pagetype: pageType, savestate: saveState });
                     }
                     
@@ -541,7 +1087,7 @@ function addListeners()
                 
                 saveState = (message.success ? 6 : -1);
                 
-                chrome.runtime.sendMessage({ type: "saveDone", success: message.success, pagetype: pageType, savestate: saveState });
+                notifySaveDone(message.success);
                 
                 break;
         }
@@ -554,10 +1100,14 @@ function addListeners()
 
 function performAction()
 {
+    saveOperationMode = "download";
+    
     if (menuAction <= 1)  /* save page */
     {
         if (pageType < 2)  /* not saved page with resource loader */
         {
+            setTestObserverCaptureActive(true,"performAction");
+            
             chrome.runtime.sendMessage({ type: "setDelay", milliseconds: saveDelayTime*1000 },  /* allow time for more content to load (e.g. search results) */
             function(response)
             {
@@ -578,7 +1128,7 @@ function performAction()
             {
                 saveState = -1;
                 
-                chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                notifySaveExit();
             }
         }
     }
@@ -689,7 +1239,7 @@ function forceLazyContent()
                     {
                         saveState = -1;
                         
-                        chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                        notifySaveExit();
                     }
                     else
                     {
@@ -786,7 +1336,7 @@ function forceLazyContent()
                         {
                             saveState = -1;
                             
-                            chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                            notifySaveExit();
                         }
                         else
                         {
@@ -2411,7 +2961,11 @@ function checkResources()
             }
         }
         
-        if (dataurisize > maxTotalSize*1024*1024)
+        if (saveOperationMode == "buffer")
+        {
+            enterComments();
+        }
+        else if (dataurisize > maxTotalSize*1024*1024)
         {
             showMessage("Total size of resources is too large","Save",
                         "Cannot save page because the total size of resources exceeds " + maxTotalSize + "MB.\n\n" +
@@ -2426,7 +2980,7 @@ function checkResources()
                             
                             saveState = -1;
                             
-                            chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                            notifySaveExit();
                         });
         }
         else if (showWarning && !(skipWarningsComments && multipleSaves))
@@ -2449,7 +3003,7 @@ function checkResources()
                                 
                                 saveState = -1;
                                 
-                                chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                                notifySaveExit();
                             });
             }
             else if (failcount > 0) someResourcesNotLoaded();
@@ -2485,7 +3039,7 @@ function checkResources()
                 
                 saveState = -1;
                 
-                chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+                notifySaveExit();
             });
     }
     
@@ -2616,7 +3170,7 @@ function checkResources()
             
             saveState = -1;
             
-            chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+            notifySaveExit();
         }
     }
 }
@@ -2628,6 +3182,17 @@ function checkResources()
 function enterComments()
 {
     var parser,commentsdoc,container,comments;
+    
+    if (saveOperationMode == "buffer")
+    {
+        chrome.runtime.sendMessage({ type: "setDelay", milliseconds: 10 },
+        function(response)
+        {
+            generateHTML();
+        });
+        
+        return;
+    }
     
     /* Load comments panel */
     
@@ -2708,7 +3273,7 @@ function enterComments()
         
         saveState = -1;
         
-        chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+        notifySaveExit();
     }
 }
 
@@ -2718,7 +3283,7 @@ function enterComments()
 
 function generateHTML()
 {
-    var i,j,totalscans,totalloads,maxstrsize,totalstrsize,count,mimetype,charset,pageurl,htmlString,htmlIndex,filename,htmlBlob,objectURL,link;
+    var i,j,totalscans,totalloads,maxstrsize,totalstrsize,count,mimetype,charset,pageurl,htmltext,htmlString,htmlIndex,filename,htmlBlob,objectURL,link;
     
     passNumber = 3;
     
@@ -2853,84 +3418,68 @@ function generateHTML()
         
         saveState = -1;
         
-        chrome.runtime.sendMessage({ type: "saveExit", pagetype: pageType, savestate: saveState });
+        notifySaveExit();
     }
-    else if (cspRestriction || useNewSaveMethod || useAutomation)  /* use new save method - chrome.downloads.download() */ 
+    else
     {
-        // createLargeTestFile();
-        
         pageurl = (pageType == 0) ? document.URL : document.querySelector("meta[name='savepage-url']").content;
         
         filename = getSavedFileName(pageurl,document.title,false);
-        
-        /* Transfer html strings to download iframe script */
-        
-        htmlString = "";
-        htmlIndex = 0;
-        
-        for (i = 0; i < htmlStrings.length; i++)
+
+        if (saveOperationMode == "buffer")
         {
-            htmlString += htmlStrings[i];
+            htmltext = htmlStrings.join("");
+            htmlStrings.length = 0;
             
-            if (htmlString.length >= 1024*1024 || i == htmlStrings.length-1)  /* >= 1MB */
+            storeBufferedCapture(htmltext,filename,pageurl);
+            finishBufferedCapture();
+        }
+        else if (cspRestriction || useNewSaveMethod || useAutomation)  /* use new save method - chrome.downloads.download() */ 
+        {
+            htmltext = htmlStrings.join("");
+            htmlStrings.length = 0;
+            
+            transferHtmlToDownload(htmltext,filename);
+            
+            htmltext = "";
+        }
+        else  /* use old save method - HTML5 download attribute */
+        {
+            htmlBlob = new Blob(htmlStrings, { type : "text/html" });
+            
+            objectURL = window.URL.createObjectURL(htmlBlob);
+            
+            htmlBlob = null;
+            
+            htmlStrings.length = 0;
+            
+            /* Save page using HTML5 download attribute */
+            
+            link = document.createElement("a");
+            link.download = filename;
+            link.href = objectURL;
+            
+            link.addEventListener("click",handleClick,true);
+            
+            link.dispatchEvent(new MouseEvent("click"));  /* save page as .html file */
+            
+            link.removeEventListener("click",handleClick,true);
+            
+            function handleClick(event)
             {
-                chrome.runtime.sendMessage({ type: "transferString", htmlstring: htmlString, htmlindex: htmlIndex });
-                
-                htmlString = "";
-                htmlIndex++;
+                event.stopPropagation();
             }
-        }
-        
-        htmlStrings.length = 0;
-        
-        /* Save page in download iframe script */
-        
-        chrome.runtime.sendMessage({ type: "savePage", filename: filename });
-    }
-    else  /* use old save method - HTML5 download attribute */
-    {
-        // createLargeTestFile();
-        
-        pageurl = (pageType == 0) ? document.URL : document.querySelector("meta[name='savepage-url']").content;
-        
-        filename = getSavedFileName(pageurl,document.title,false);
-        
-        /* Convert html strings to html blob */
-        
-        htmlBlob = new Blob(htmlStrings, { type : "text/html" });
-        
-        objectURL = window.URL.createObjectURL(htmlBlob);
-        
-        htmlBlob = null;
-        
-        htmlStrings.length = 0;
-        
-        /* Save page using HTML5 download attribute */
-        
-        link = document.createElement("a");
-        link.download = filename;
-        link.href = objectURL;
-        
-        link.addEventListener("click",handleClick,true);
-        
-        link.dispatchEvent(new MouseEvent("click"));  /* save page as .html file */
-        
-        link.removeEventListener("click",handleClick,true);
-        
-        function handleClick(event)
-        {
-            event.stopPropagation();
-        }
-        
-        chrome.runtime.sendMessage({ type: "setDelay", milliseconds: 100 },  /* allow time before revoking object URL */
-        function(response)
-        {
-            window.URL.revokeObjectURL(objectURL);
             
-            saveState = 6;
-            
-            chrome.runtime.sendMessage({ type: "saveDone", success: true, pagetype: pageType, savestate: saveState   });
-        });
+            chrome.runtime.sendMessage({ type: "setDelay", milliseconds: 100 },  /* allow time before revoking object URL */
+            function(response)
+            {
+                window.URL.revokeObjectURL(objectURL);
+                
+                saveState = 6;
+                
+                notifySaveDone(true);
+            });
+        }
     }
 }
 
@@ -2972,6 +3521,8 @@ function extractHTML(depth,frame,element,crossframe,nosrcframe,framekey,parentpr
     var voidElements = ["area","base","br","col","command","embed","frame","hr","img","input","keygen","link","menuitem","meta","param","source","track","wbr"];  /* W3C HTML5 2011 4.3 Elements + menuitem */
     var retainElements = ["html","head","body","base","command","link","meta","noscript","script","style","template","title"];
     var hiddenElements = ["area","base","datalist","head","link","meta","param","rp","script","source","style","template","track","title"];  /* W3C HTML5 2014 10.3.1 Hidden Elements */
+    
+    if (isTransientSavePageElement(element)) return;
     
     /* Check for <button> element inside ancestor <button> element - W3C HTML5 2011 4.10.8 The button Element (no interactive content) */
     
@@ -4400,10 +4951,9 @@ function extractHTML(depth,frame,element,crossframe,nosrcframe,framekey,parentpr
                 {
                     if (element.childNodes[i].nodeType == 1)  /* element node */
                     {
+                        if (isTransientSavePageElement(element.childNodes[i])) continue;
                         if (depth == 0)
                         {
-                            if (element.childNodes[i].localName == "iframe" && element.childNodes[i].id.substr(0,8) == "savepage") continue;
-                            if (element.childNodes[i].localName == "script" && element.childNodes[i].id.substr(0,8) == "savepage") continue;
                             if (element.childNodes[i].localName == "meta" && element.childNodes[i].name.substr(0,8) == "savepage") continue;
                         }
                         
@@ -4422,8 +4972,7 @@ function extractHTML(depth,frame,element,crossframe,nosrcframe,framekey,parentpr
                             if (text.trim() == "" && (i+1) < element.childNodes.length && element.childNodes[i+1].nodeType == 1)
                             {
                                 if (element.childNodes[i+1].localName == "base") continue;
-                                if (element.childNodes[i+1].localName == "iframe" && element.childNodes[i+1].id.substr(0,8) == "savepage") continue;
-                                if (element.childNodes[i+1].localName == "script" && element.childNodes[i+1].id.substr(0,8) == "savepage") continue;
+                                if (isTransientSavePageElement(element.childNodes[i+1])) continue;
                                 if (element.childNodes[i+1].localName == "meta" && element.childNodes[i+1].name.substr(0,8) == "savepage") continue;
                             }
                                 

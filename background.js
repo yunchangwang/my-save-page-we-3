@@ -57,6 +57,19 @@
 
 /************************************************************************/
 /*                                                                      */
+/* Auto Capture IndexedDB Storage                                       */
+/*                                                                      */
+/************************************************************************/
+
+var autoCaptureDBPromise = null;
+var autoCaptureDBName = "savepagewe-autocapture";
+var autoCaptureDBVersion = 1;
+var autoCaptureSnapshotStore = "snapshots";
+var autoCaptureMetaStore = "meta";
+var autoCaptureMetaTotalBytesKey = "totalbytes";
+
+/************************************************************************/
+/*                                                                      */
 /* Manifest Version 3 - Management of Settings                          */
 /*                                                                      */
 /* 1. The value of the extension's global badge background color is     */
@@ -617,6 +630,8 @@ function initialize(isfirefox,platformos)
         if (!("options-urllistname" in local)) local["options-urllistname"] = "";
         
         if (!("options-savedfilename" in local)) local["options-savedfilename"] = "%TITLE%";
+        if (!("options-autocapturefolder" in local)) local["options-autocapturefolder"] = "SavePageWE/AutoCapture";
+        if (!("options-autocapturelimitmb" in local)) local["options-autocapturelimitmb"] = 10;
         if (!("options-replacespaces" in local)) local["options-replacespaces"] = false;
         if (!("options-replacechar" in local)) local["options-replacechar"] = "-";
         if (!("options-maxfilenamelength" in local)) local["options-maxfilenamelength"] = 150;
@@ -679,6 +694,7 @@ function initialize(isfirefox,platformos)
             chrome.contextMenus.create({ id: "cancelsave", title: "Cancel Save", contexts: contexts, enabled: true });
             chrome.contextMenus.create({ id: "viewpageinfo", title: "View Saved Page Info", contexts: contexts, enabled: true });
             chrome.contextMenus.create({ id: "removeresourceloader", title: "Remove Resource Loader", contexts: contexts, enabled: true });
+            chrome.contextMenus.create({ id: "opencapturecontrol", title: "打开自动抓取控制台", contexts: [ "action" ], enabled: true });
             chrome.contextMenus.create({ id: "extractmedia", title: "Extract Image/Audio/Video", contexts: [ "image","audio","video" ], enabled: true });
             
             chrome.contextMenus.create({ id: "saveselectedtabs-basicitems", parentId: "saveselectedtabs", title: "Basic Items", contexts: [ "all" ], enabled: true });
@@ -824,6 +840,7 @@ function(clickData,tab)
         else if (clickData.menuItemId == "cancelsave") cancelAction(local);
         else if (clickData.menuItemId == "viewpageinfo") initiateAction(2,null,null,null,false,false,local);
         else if (clickData.menuItemId == "removeresourceloader") initiateAction(3,null,null,null,false,false,local);
+        else if (clickData.menuItemId == "opencapturecontrol") chrome.tabs.create({ url: chrome.runtime.getURL("capture-control.html?tabId=" + tab.id) });
         else if (clickData.menuItemId == "extractmedia") initiateAction(4,null,null,clickData.srcUrl,false,false,local);
     });
 });
@@ -984,15 +1001,18 @@ function(message,sender,sendResponse)
                 
                 updateContextMenus(sender.tab,local);
                 
-                chrome.tabs.sendMessage(sender.tab.id,{ type: "performAction",
-                                                        menuaction: local["actions-details"][sender.tab.id].menuaction,
-                                                        saveditems: local["actions-details"][sender.tab.id].saveditems,
-                                                        togglelazy: local["actions-details"][sender.tab.id].togglelazy,
-                                                        extractsrcurl: local["actions-details"][sender.tab.id].extractsrcurl,
-                                                        externalsave: local["actions-details"][sender.tab.id].externalsave,
-                                                        swapdevices: local["actions-details"][sender.tab.id].swapdevices,
-                                                        multiplesaves: local["actions-details"][sender.tab.id].multiplesaves,
-                                                        csprestriction: local["actions-details"][sender.tab.id].csprestriction },checkError);
+                if (local["actions-details"][sender.tab.id])
+                {
+                    chrome.tabs.sendMessage(sender.tab.id,{ type: "performAction",
+                                                            menuaction: local["actions-details"][sender.tab.id].menuaction,
+                                                            saveditems: local["actions-details"][sender.tab.id].saveditems,
+                                                            togglelazy: local["actions-details"][sender.tab.id].togglelazy,
+                                                            extractsrcurl: local["actions-details"][sender.tab.id].extractsrcurl,
+                                                            externalsave: local["actions-details"][sender.tab.id].externalsave,
+                                                            swapdevices: local["actions-details"][sender.tab.id].swapdevices,
+                                                            multiplesaves: local["actions-details"][sender.tab.id].multiplesaves,
+                                                            csprestriction: local["actions-details"][sender.tab.id].csprestriction },checkError);
+                }
                 
                 break;
                 
@@ -1032,6 +1052,42 @@ function(message,sender,sendResponse)
                 chrome.tabs.sendMessage(sender.tab.id,{ type: "replyFrame", key: message.key, url: message.url, html: message.html, fonts: message.fonts },checkError);
                 
                 break;
+                
+            case "triggerTestObserverCapture":
+                
+                triggerTestObserverCapture(sender.tab.id,sender.tab.windowId,local,sendResponse);
+                
+                return true;  /* asynchronous response */
+
+            case "storeAutoCaptureSnapshot":
+                
+                storeAutoCaptureSnapshot(sender.tab.id,message,local,sendResponse);
+                
+                return true;  /* asynchronous response */
+                
+            case "getAutoCaptureStorageState":
+                
+                getAutoCaptureStorageState(message.tabid,local,sendResponse);
+                
+                return true;  /* asynchronous response */
+                
+            case "getAutoCaptureSnapshotList":
+                
+                getAutoCaptureSnapshotList(message.tabid,sendResponse);
+                
+                return true;  /* asynchronous response */
+                
+            case "getAutoCaptureSnapshotHtml":
+                
+                getAutoCaptureSnapshotHtml(message.tabid,message.id,sendResponse);
+                
+                return true;  /* asynchronous response */
+                
+            case "clearAutoCaptureSnapshots":
+                
+                clearAutoCaptureSnapshots(message.tabid,sendResponse);
+                
+                return true;  /* asynchronous response */
                 
             case "loadResource":
                 
@@ -1084,7 +1140,10 @@ function(message,sender,sendResponse)
         }
     });
     
-    if (message.type == "getTabId" || message.type == "getFiles" || message.type == "setDelay") return true;  /* keep  message channel open for sendResponse */
+    if (message.type == "getTabId" || message.type == "getFiles" || message.type == "setDelay" ||
+        message.type == "storeAutoCaptureSnapshot" || message.type == "getAutoCaptureStorageState" ||
+        message.type == "getAutoCaptureSnapshotList" || message.type == "getAutoCaptureSnapshotHtml" ||
+        message.type == "clearAutoCaptureSnapshots") return true;  /* keep  message channel open for sendResponse */
 });
 
 /* External message received listener */
@@ -1610,6 +1669,375 @@ function performAction(menuaction,saveditems,togglelazy,extractsrcurl,externalsa
             }
         }
     });
+}
+
+function triggerTestObserverCapture(tabId,windowId,local,sendResponse)
+{
+    var saveditems,selectedtabids,listedurls,multiplesaves;
+    
+    if (!senderTabSavable(tabId,local))
+    {
+        sendResponse({ started: false, reason: "state-busy" });
+        return;
+    }
+    
+    saveditems = local["options-buttonactionitems"];
+    selectedtabids = [];
+    listedurls = [];
+    multiplesaves = false;
+    
+    local["actions-cancelsave"] = false;
+    
+    chrome.storage.local.set({ "actions-cancelsave": local["actions-cancelsave"] },
+    function()
+    {
+        performAction(0,saveditems,false,null,false,false,windowId,selectedtabids,listedurls,multiplesaves,tabId,local);
+        sendResponse({ started: true });
+    });
+}
+
+function senderTabSavable(tabId,local)
+{
+    var actionDetails,saveStates;
+    
+    actionDetails = local["actions-details"] || {};
+    saveStates = local["tabs-savestate"] || {};
+    
+    return !(tabId in actionDetails) ||
+           saveStates[tabId] == -1 ||
+           (saveStates[tabId] >= 6 && saveStates[tabId] <= 8);
+}
+
+/************************************************************************/
+/*                                                                      */
+/* Auto capture IndexedDB functions                                     */
+/*                                                                      */
+/************************************************************************/
+
+async function openAutoCaptureDB()
+{
+    if (autoCaptureDBPromise == null)
+    {
+        autoCaptureDBPromise = new Promise(function(resolve,reject)
+        {
+            var request;
+            
+            request = indexedDB.open(autoCaptureDBName,autoCaptureDBVersion);
+            
+            request.onupgradeneeded = function()
+            {
+                var db,store;
+                
+                db = request.result;
+                
+                if (!db.objectStoreNames.contains(autoCaptureSnapshotStore))
+                {
+                    store = db.createObjectStore(autoCaptureSnapshotStore,{ keyPath: "id", autoIncrement: true });
+                    store.createIndex("tabid","tabid",{ unique: false });
+                }
+                
+                if (!db.objectStoreNames.contains(autoCaptureMetaStore))
+                {
+                    db.createObjectStore(autoCaptureMetaStore,{ keyPath: "key" });
+                }
+            };
+            
+            request.onsuccess = function()
+            {
+                resolve(request.result);
+            };
+            
+            request.onerror = function()
+            {
+                autoCaptureDBPromise = null;
+                reject(request.error || new Error("Failed to open IndexedDB."));
+            };
+        });
+    }
+    
+    return autoCaptureDBPromise;
+}
+
+function autoCaptureRequestToPromise(request)
+{
+    return new Promise(function(resolve,reject)
+    {
+        request.onsuccess = function()
+        {
+            resolve(request.result);
+        };
+        
+        request.onerror = function()
+        {
+            reject(request.error || new Error("IndexedDB request failed."));
+        };
+    });
+}
+
+function autoCaptureTransactionDone(transaction)
+{
+    return new Promise(function(resolve,reject)
+    {
+        transaction.oncomplete = function()
+        {
+            resolve();
+        };
+        
+        transaction.onabort = function()
+        {
+            reject(transaction.error || new Error("IndexedDB transaction aborted."));
+        };
+        
+        transaction.onerror = function()
+        {
+            reject(transaction.error || new Error("IndexedDB transaction failed."));
+        };
+    });
+}
+
+async function autoCaptureGetTotalBytes()
+{
+    var db,transaction,store,entry,totalbytes;
+    
+    db = await openAutoCaptureDB();
+    transaction = db.transaction([ autoCaptureMetaStore ],"readonly");
+    store = transaction.objectStore(autoCaptureMetaStore);
+    entry = await autoCaptureRequestToPromise(store.get(autoCaptureMetaTotalBytesKey));
+    
+    totalbytes = (entry && entry.value) ? entry.value : 0;
+    
+    await autoCaptureTransactionDone(transaction);
+    
+    return totalbytes;
+}
+
+async function autoCaptureGetSnapshotSummaries(tabId)
+{
+    var db,transaction,store,index,summaries;
+    
+    db = await openAutoCaptureDB();
+    transaction = db.transaction([ autoCaptureSnapshotStore ],"readonly");
+    store = transaction.objectStore(autoCaptureSnapshotStore);
+    index = store.index("tabid");
+    summaries = [];
+    
+    await new Promise(function(resolve,reject)
+    {
+        var request;
+        
+        request = index.openCursor(IDBKeyRange.only(tabId));
+        
+        request.onsuccess = function(event)
+        {
+            var cursor,value;
+            
+            cursor = event.target.result;
+            
+            if (cursor == null)
+            {
+                resolve();
+                return;
+            }
+            
+            value = cursor.value;
+            
+            summaries.push({
+                id: value.id,
+                filename: value.filename,
+                capturedat: value.capturedat,
+                title: value.title,
+                url: value.url,
+                size: value.size
+            });
+            
+            cursor.continue();
+        };
+        
+        request.onerror = function()
+        {
+            reject(request.error || new Error("Failed to read auto capture snapshots."));
+        };
+    });
+    
+    await autoCaptureTransactionDone(transaction);
+    
+    summaries.sort(function(a,b) { return a.id-b.id; });
+    
+    return summaries;
+}
+
+async function autoCaptureEstimateBytes(html)
+{
+    return (new Blob([ html ],{ type: "text/html" })).size;
+}
+
+async function storeAutoCaptureSnapshot(tabId,message,local,sendResponse)
+{
+    var db,transaction,snapshotStore,metaStore,totalbytes,limitbytes,size,record,addRequest,countRequest,snapshotcount;
+    
+    try
+    {
+        db = await openAutoCaptureDB();
+        totalbytes = await autoCaptureGetTotalBytes();
+        limitbytes = Math.max(10,+(local["options-autocapturelimitmb"] || 10))*1024*1024;
+        size = await autoCaptureEstimateBytes(message.html || "");
+        
+        if (totalbytes + size > limitbytes)
+        {
+            sendResponse({ stored: false, reason: "limit", totalbytes: totalbytes, limitbytes: limitbytes });
+            return;
+        }
+        
+        transaction = db.transaction([ autoCaptureSnapshotStore,autoCaptureMetaStore ],"readwrite");
+        snapshotStore = transaction.objectStore(autoCaptureSnapshotStore);
+        metaStore = transaction.objectStore(autoCaptureMetaStore);
+        
+        record = {
+            tabid: tabId,
+            filename: message.filename,
+            html: message.html,
+            url: message.url,
+            title: message.title,
+            capturedat: message.capturedat,
+            sequence: message.sequence,
+            signature: message.signature,
+            size: size
+        };
+        
+        addRequest = snapshotStore.add(record);
+        await autoCaptureRequestToPromise(addRequest);
+        
+        totalbytes += size;
+        metaStore.put({ key: autoCaptureMetaTotalBytesKey, value: totalbytes });
+        countRequest = snapshotStore.index("tabid").count(IDBKeyRange.only(tabId));
+        snapshotcount = await autoCaptureRequestToPromise(countRequest);
+        
+        await autoCaptureTransactionDone(transaction);
+        
+        sendResponse({ stored: true, id: addRequest.result, snapshotcount: snapshotcount, totalbytes: totalbytes, limitbytes: limitbytes });
+    }
+    catch (e)
+    {
+        sendResponse({ stored: false, reason: "error", message: e.message });
+    }
+}
+
+async function getAutoCaptureStorageState(tabId,local,sendResponse)
+{
+    var totalbytes,limitbytes,snapshots,latest;
+    
+    try
+    {
+        totalbytes = await autoCaptureGetTotalBytes();
+        snapshots = await autoCaptureGetSnapshotSummaries(tabId);
+        latest = (snapshots.length > 0) ? snapshots[snapshots.length-1] : null;
+        limitbytes = Math.max(10,+(local["options-autocapturelimitmb"] || 10))*1024*1024;
+        
+        sendResponse({
+            snapshotcount: snapshots.length,
+            totalbytes: totalbytes,
+            limitbytes: limitbytes,
+            filename: latest ? latest.filename : "",
+            capturedat: latest ? latest.capturedat : 0
+        });
+    }
+    catch (e)
+    {
+        sendResponse({ snapshotcount: 0, totalbytes: 0, limitbytes: 0, filename: "", capturedat: 0, error: e.message });
+    }
+}
+
+async function getAutoCaptureSnapshotList(tabId,sendResponse)
+{
+    try
+    {
+        sendResponse({ snapshots: await autoCaptureGetSnapshotSummaries(tabId) });
+    }
+    catch (e)
+    {
+        sendResponse({ snapshots: [], error: e.message });
+    }
+}
+
+async function getAutoCaptureSnapshotHtml(tabId,id,sendResponse)
+{
+    var db,transaction,store,record;
+    
+    try
+    {
+        db = await openAutoCaptureDB();
+        transaction = db.transaction([ autoCaptureSnapshotStore ],"readonly");
+        store = transaction.objectStore(autoCaptureSnapshotStore);
+        record = await autoCaptureRequestToPromise(store.get(id));
+        
+        await autoCaptureTransactionDone(transaction);
+        
+        if (record && record.tabid == tabId) sendResponse({ id: record.id, filename: record.filename, html: record.html });
+        else sendResponse({ id: id, filename: "", html: "" });
+    }
+    catch (e)
+    {
+        sendResponse({ id: id, filename: "", html: "", error: e.message });
+    }
+}
+
+async function clearAutoCaptureSnapshots(tabId,sendResponse)
+{
+    var db,transaction,snapshotStore,metaStore,index,totalbytes,removedbytes,snapshots;
+    
+    try
+    {
+        db = await openAutoCaptureDB();
+        snapshots = await autoCaptureGetSnapshotSummaries(tabId);
+        totalbytes = await autoCaptureGetTotalBytes();
+        removedbytes = 0;
+        
+        transaction = db.transaction([ autoCaptureSnapshotStore,autoCaptureMetaStore ],"readwrite");
+        snapshotStore = transaction.objectStore(autoCaptureSnapshotStore);
+        metaStore = transaction.objectStore(autoCaptureMetaStore);
+        index = snapshotStore.index("tabid");
+        
+        await new Promise(function(resolve,reject)
+        {
+            var request;
+            
+            request = index.openCursor(IDBKeyRange.only(tabId));
+            
+            request.onsuccess = function(event)
+            {
+                var cursor,value;
+                
+                cursor = event.target.result;
+                
+                if (cursor == null)
+                {
+                    resolve();
+                    return;
+                }
+                
+                value = cursor.value;
+                removedbytes += value.size || 0;
+                cursor.delete();
+                cursor.continue();
+            };
+            
+            request.onerror = function()
+            {
+                reject(request.error || new Error("Failed to clear auto capture snapshots."));
+            };
+        });
+        
+        totalbytes = Math.max(0,totalbytes-removedbytes);
+        metaStore.put({ key: autoCaptureMetaTotalBytesKey, value: totalbytes });
+        
+        await autoCaptureTransactionDone(transaction);
+        
+        sendResponse({ cleared: true, snapshotcount: 0, totalbytes: totalbytes, removed: snapshots.length });
+    }
+    catch (e)
+    {
+        sendResponse({ cleared: false, error: e.message });
+    }
 }
 
 function finishAction(tabId,success,local)
