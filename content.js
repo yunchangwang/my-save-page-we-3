@@ -518,6 +518,17 @@ function triggerTestObserverCapture()
     beginBufferedCapture();
 }
 
+function startInitialBufferedCapture()
+{
+    if (!autoCaptureListening || pageType >= 2 || (saveState >= 0 && saveState <= 5)) return false;
+    
+    resetTestObserverPending();
+    setTestObserverCaptureActive(true,"observer-start");
+    beginBufferedCapture();
+    
+    return true;
+}
+
 function startBufferedCaptureAndSave()
 {
     resetTestObserverPending();
@@ -943,7 +954,9 @@ function addListeners()
                 autoCaptureStopAfterCurrent = false;
                 autoCaptureStorageFull = false;
                 autoCaptureStorageFullNotified = false;
+                resetTestObserverPending();
                 clearBufferedCapture();
+                startInitialBufferedCapture();
                 
                 sendResponse({ listening: autoCaptureListening, hasbuffer: false, snapshotcount: 0, storagefull: autoCaptureStorageFull });
                 
@@ -3432,7 +3445,6 @@ function generateHTML()
             htmlStrings.length = 0;
             
             storeBufferedCapture(htmltext,filename,pageurl);
-            finishBufferedCapture();
         }
         else if (cspRestriction || useNewSaveMethod || useAutomation)  /* use new save method - chrome.downloads.download() */ 
         {
