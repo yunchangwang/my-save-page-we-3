@@ -840,7 +840,12 @@ function(clickData,tab)
         else if (clickData.menuItemId == "cancelsave") cancelAction(local);
         else if (clickData.menuItemId == "viewpageinfo") initiateAction(2,null,null,null,false,false,local);
         else if (clickData.menuItemId == "removeresourceloader") initiateAction(3,null,null,null,false,false,local);
-        else if (clickData.menuItemId == "opencapturecontrol") chrome.tabs.create({ url: chrome.runtime.getURL("capture-control.html?tabId=" + tab.id) });
+        else if (clickData.menuItemId == "opencapturecontrol") {
+            chrome.windows.getCurrent(function(window) {
+                // 同时传递windowId和当前Tab的ID
+                chrome.tabs.create({ url: chrome.runtime.getURL("capture-control.html?windowId=" + window.id + "&initialTabId=" + tab.id) });
+            });
+        }
         else if (clickData.menuItemId == "extractmedia") initiateAction(4,null,null,clickData.srcUrl,false,false,local);
     });
 });
