@@ -44,6 +44,9 @@
 /*                                                                      */
 /************************************************************************/
 
+import * as networkMonitor from "./network-monitor.js";
+import { buildMergedHar } from "./har.js";
+
 /************************************************************************/
 /*                                                                      */
 /* Manifest Version 3 - Background Service Worker                       */
@@ -842,7 +845,6 @@ function(clickData,tab)
         else if (clickData.menuItemId == "removeresourceloader") initiateAction(3,null,null,null,false,false,local);
         else if (clickData.menuItemId == "opencapturecontrol") {
             chrome.windows.getCurrent(function(window) {
-                // 同时传递windowId和当前Tab的ID
                 chrome.tabs.create({ url: chrome.runtime.getURL("capture-control.html?windowId=" + window.id + "&initialTabId=" + tab.id) });
             });
         }
@@ -976,6 +978,46 @@ function(details)
 chrome.runtime.onMessage.addListener(
 function(message,sender,sendResponse)
 {
+    // 处理网络录制相关的消息（不依赖storage）
+    if (message.type === "getNetworkRecordings") {
+        console.log("[DEBUG BG] getNetworkRecordings 被调用");
+
+        try {
+            const recordings = networkMonitor.getCompletedRecordings();
+            console.log("[DEBUG BG] 获取到", recordings.length, "个录制");
+
+            if (!recordings || recordings.length === 0) {
+                console.log("[DEBUG BG] 没有录制数据，返回空数组");
+                sendResponse({ recordings: [] });
+            } else {
+                // 保留完整的 entries 数据，不做简化
+                sendResponse({ recordings: recordings });
+            }
+        } catch (error) {
+            console.error("[DEBUG BG] getNetworkRecordings 错误:", error);
+            sendResponse({ error: true, message: error.message || String(error) });
+        }
+
+        return true;
+    }
+
+    if (message.type === "buildHar") {
+        console.log("[DEBUG BG] buildHar 被调用，录制数量:", message.recordings?.length);
+
+        try {
+            const har = buildMergedHar(message.recordings);
+            const harString = JSON.stringify(har, null, 2);
+            console.log("[DEBUG BG] 生成的HAR字符串长度:", harString.length);
+            sendResponse({ har: harString });
+        } catch (error) {
+            console.error("[DEBUG BG] buildHar 错误:", error);
+            sendResponse({ error: true, message: error.message || String(error) });
+        }
+
+        return true;
+    }
+
+    // 其他消息继续使用原有的逻辑
     chrome.storage.local.get(null,
     function(local)
     {
@@ -1142,13 +1184,84 @@ function(message,sender,sendResponse)
                 finishAction(sender.tab.id,message.success,local);
                 
                 break;
+
+            /* Network monitoring messages */
+
+            case "startNetworkRecording":
+
+                (async function() {
+                    try {
+                        const result = await networkMonitor.startNetworkRecording(message.tabId);
+                        sendResponse(result);
+                    } catch (error) {
+                        sendResponse({ error: true, message: error.message || String(error) });
+                    }
+                })();
+
+                return true;  /* asynchronous response */
+
+            case "stopNetworkRecording":
+
+                (async function() {
+                    try {
+                        const result = await networkMonitor.stopNetworkRecording();
+                        sendResponse(result);
+                    } catch (error) {
+                        sendResponse({ error: true, message: error.message || String(error) });
+                    }
+                })();
+
+                return true;  /* asynchronous response */
+
+            case "getNetworkStatus":
+
+                (async function() {
+                    try {
+                        const status = networkMonitor.getNetworkStatus();
+                        sendResponse(status);
+                    } catch (error) {
+                        sendResponse({ error: true, message: error.message || String(error) });
+                    }
+                })();
+
+                return true;  /* asynchronous response */
+
+            case "exportHar":
+
+                (async function() {
+                    try {
+                        // 获取用户设置的子目录
+                        const folder = local["options-autocapturefolder"] || "";
+                        const sanitizedFolder = folder.trim().replace(/\\/g, "/").replace(/[<>:"|?*\u0000-\u001F]/g, "-");
+
+                        const result = await networkMonitor.exportHar(sanitizedFolder);
+                        sendResponse(result);
+                    } catch (error) {
+                        sendResponse({ error: true, message: error.message || String(error) });
+                    }
+                })();
+
+                return true;  /* asynchronous response */
+
+            case "clearNetworkRecordings":
+
+                try {
+                    networkMonitor.clearNetworkRecordings();
+                    sendResponse({ message: "Network recordings cleared." });
+                } catch (error) {
+                    sendResponse({ error: true, message: error.message || String(error) });
+                }
+
+                break;
         }
     });
-    
+
     if (message.type == "getTabId" || message.type == "getFiles" || message.type == "setDelay" ||
         message.type == "storeAutoCaptureSnapshot" || message.type == "getAutoCaptureStorageState" ||
         message.type == "getAutoCaptureSnapshotList" || message.type == "getAutoCaptureSnapshotHtml" ||
-        message.type == "clearAutoCaptureSnapshots") return true;  /* keep  message channel open for sendResponse */
+        message.type == "clearAutoCaptureSnapshots" || message.type == "startNetworkRecording" ||
+        message.type == "stopNetworkRecording" || message.type == "getNetworkStatus" ||
+        message.type == "exportHar") return true;  /* keep message channel open for sendResponse */
 });
 
 /* External message received listener */

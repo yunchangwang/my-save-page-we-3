@@ -10,6 +10,7 @@ var trackingListeners = [];
 var previousTabState = {};  // 用于记录之前Tab的监听状态
 var isGloballyListening = false;  // 全局监听状态：用户是否开启了监听
 var isMigrating = false;  // 是否正在迁移中（防止重复迁移）
+var isNetworkRecording = false;  // 网络录制状态
 
 function onLoadPage()
 {
@@ -21,6 +22,7 @@ function onLoadPage()
     document.getElementById("start-button").addEventListener("click",startListening,false);
     document.getElementById("stop-button").addEventListener("click",stopListeningAndSave,false);
     document.getElementById("clear-button").addEventListener("click",clearBufferedSnapshots,false);
+    document.getElementById("capture-network-checkbox").addEventListener("change",handleNetworkCheckboxChange,false);
     window.addEventListener("beforeunload",cleanup,false);
 
     loadSettings();
@@ -31,7 +33,7 @@ function onLoadPage()
 
 async function startListening()
 {
-    var tab,state;
+    var tab,state,checkbox;
 
     setStatus("正在开启监听...");
 
@@ -44,8 +46,14 @@ async function startListening()
         if (!state) {
             setStatus("开启监听失败。");
         } else {
-            isGloballyListening = true;  // 标记全局监听状态
+            isGloballyListening = true;
             console.log("[AutoCapture] 全局监听已开启");
+
+            checkbox = document.getElementById("capture-network-checkbox");
+            if (checkbox && checkbox.checked) {
+                await startNetworkRecordingInternal(tab);
+            }
+
             await refreshStatus();
         }
     }
@@ -57,13 +65,14 @@ async function startListening()
 
 async function stopListeningAndSave()
 {
-    var tab,state,snapshots,i,snapshot,content,downloaded;
+    var tab,state,snapshots,i,snapshot,content,htmlSnapshots,harData,networkStatus,checkbox,completedRecordings,har;
 
     setStatus("正在停止监听...");
+    console.log("[DEBUG] ========== stopListeningAndSave 开始执行 ==========");
 
     try
     {
-        isGloballyListening = false;  // 清除全局监听状态
+        isGloballyListening = false;
         console.log("[AutoCapture] 全局监听已停止");
 
         tab = await getTargetTab();
@@ -77,16 +86,60 @@ async function stopListeningAndSave()
             await waitForCaptureIdle(tab.id);
         }
 
+        // 停止网络录制并收集HAR数据
+        checkbox = document.getElementById("capture-network-checkbox");
+        console.log("[DEBUG] checkbox 元素:", checkbox);
+        console.log("[DEBUG] checkbox.checked:", checkbox ? checkbox.checked : "checkbox is null");
+        console.log("[DEBUG] isNetworkRecording:", isNetworkRecording);
+
+        harData = null;
+
+        if (checkbox && checkbox.checked) {
+            console.log("[DEBUG] 进入了接口抓取分支");
+
+            if (isNetworkRecording) {
+                console.log("[DEBUG] 正在停止网络录制...");
+                await stopNetworkRecordingInternal();
+                console.log("[DEBUG] 网络录制已停止");
+            }
+
+            // 获取网络录制状态并导出HAR
+            try {
+                networkStatus = await sendRuntimeMessage({ type: "getNetworkStatus" });
+
+                if (networkStatus && networkStatus.totalEntryCount > 0) {
+                    setStatus("正在导出HAR文件...");
+
+                    // 直接在 background.js 中构建和导出 HAR，避免大数据传递
+                    const folder = sanitizeAutoCaptureFolder(document.getElementById("folder-input").value.trim());
+                    const harResponse = await sendRuntimeMessage({
+                        type: "exportHar",
+                        folder: folder
+                    });
+
+                    if (harResponse && !harResponse.error) {
+                        console.log("[Network Monitor] HAR文件已导出");
+                        setStatus("HAR文件已导出");
+                    }
+                }
+            } catch (e) {
+                console.error("[Network Monitor] 导出HAR失败:", e);
+            }
+        } else {
+            console.log("[DEBUG] 未勾选接口抓取复选框，跳过HAR数据收集");
+        }
+
+        // 收集所有HTML快照
         snapshots = await getSnapshotList(tab.id);
 
         if (snapshots.length == 0)
         {
-            setStatus("监听已停止，但没有可保存的缓存快照。");
+            setStatus("监听已停止，但没有可保存的数据。");
             await refreshStatus();
             return;
         }
 
-        downloaded = 0;
+        htmlSnapshots = [];
 
         for (i = 0; i < snapshots.length; i++)
         {
@@ -95,28 +148,46 @@ async function stopListeningAndSave()
 
             if (content && content.html)
             {
-                setStatus("正在保存第 " + (i+1) + " / " + snapshots.length + " 份快照...");
-                await downloadSnapshot(content.html,applyAutoCaptureFolder(content.filename));
-                downloaded++;
+                setStatus("正在收集第 " + (i+1) + " / " + snapshots.length + " 份快照...");
+                htmlSnapshots.push({
+                    filename: content.filename,
+                    html: content.html
+                });
             }
         }
 
+        // 打包下载
+        setStatus("正在打包下载...");
+        const folder = sanitizeAutoCaptureFolder(document.getElementById("folder-input").value.trim());
+        await downloadAsZip(htmlSnapshots, folder);
+
+        // 清理数据
         await sendRuntimeMessage({ type: "clearAutoCaptureSnapshots", tabid: tab.id });
         await sendTabMessage(tab.id,{ type: "resetAutoCaptureStorageState" });
 
-        setStatus("已保存 " + downloaded + " 份快照。");
+        if (harData) {
+            await sendRuntimeMessage({ type: "clearNetworkRecordings" });
+        }
+
+        var statusMessage = "已打包下载 " + htmlSnapshots.length + " 份快照";
+        if (harData) {
+            statusMessage += " 和 HAR 文件";
+        }
+        statusMessage += "。";
+        setStatus(statusMessage);
 
         window.setTimeout(refreshStatus,500);
     }
     catch (e)
     {
+        console.error("停止监听失败:", e);
         setStatus("无法停止监听。\n" + e.message);
     }
 }
 
 async function clearBufferedSnapshots()
 {
-    var tab,state;
+    var tab,state,checkbox;
 
     setStatus("正在清空缓存快照...");
 
@@ -135,6 +206,19 @@ async function clearBufferedSnapshots()
             await waitForCaptureIdle(tab.id);
         }
 
+        // 停止网络录制
+        checkbox = document.getElementById("capture-network-checkbox");
+        if (checkbox && checkbox.checked && isNetworkRecording) {
+            await stopNetworkRecordingInternal();
+
+            // 清空网络录制数据
+            try {
+                await sendRuntimeMessage({ type: "clearNetworkRecordings" });
+            } catch (e) {
+                console.error("[Network Monitor] 清空网络录制数据失败:", e);
+            }
+        }
+
         await sendRuntimeMessage({ type: "clearAutoCaptureSnapshots", tabid: tab.id });
         await sendTabMessage(tab.id,{ type: "resetAutoCaptureStorageState" });
 
@@ -149,7 +233,7 @@ async function clearBufferedSnapshots()
 
 async function refreshStatus()
 {
-    var tab,state,storage,lines,folder,limitmb;
+    var tab,state,storage,lines,folder,limitmb,networkStatus,checkbox;
 
     try
     {
@@ -164,6 +248,16 @@ async function refreshStatus()
             return;
         }
 
+        // 获取网络状态
+        checkbox = document.getElementById("capture-network-checkbox");
+        if (checkbox && checkbox.checked) {
+            try {
+                networkStatus = await sendRuntimeMessage({ type: "getNetworkStatus" });
+            } catch (e) {
+                console.error("[Network Monitor] 获取网络状态失败:", e);
+            }
+        }
+
         lines = [];
         lines.push("=== 窗口级监控模式 ===");
         lines.push("窗口ID：" + targetWindowId);
@@ -175,6 +269,15 @@ async function refreshStatus()
         lines.push("抓取进行中：" + (state.capturing ? "是" : "否"));
         lines.push("缓存已满：" + (state.storagefull ? "是" : "否"));
         lines.push("缓存快照数：" + ((storage && storage.snapshotcount) || 0));
+
+        // 显示网络状态
+        if (networkStatus) {
+            lines.push("网络录制：" + (networkStatus.isRecording ? "进行中" : "未开启"));
+            if (networkStatus.totalEntryCount > 0) {
+                lines.push("已捕获接口数：" + networkStatus.totalEntryCount);
+            }
+        }
+
         folder = document.getElementById("folder-input").value.trim();
         lines.push("保存子目录：" + (folder || "（默认下载目录）"));
         limitmb = +(document.getElementById("limit-input").value || 0);
@@ -285,10 +388,10 @@ function sanitizeAutoCaptureFolder(folder)
 async function downloadSnapshot(htmltext,filename)
 {
     var blob,objectURL,downloadId;
-    
+
     blob = new Blob([ htmltext ],{ type: "text/html" });
     objectURL = URL.createObjectURL(blob);
-    
+
     try
     {
         downloadId = await chrome.downloads.download({ url: objectURL, filename: filename, saveAs: false });
@@ -298,20 +401,71 @@ async function downloadSnapshot(htmltext,filename)
         URL.revokeObjectURL(objectURL);
         throw e;
     }
-    
+
     await waitForDownload(downloadId);
-    
+
     URL.revokeObjectURL(objectURL);
 }
+
+async function downloadAsZip(htmlSnapshots, folder)
+{
+    var zip, filename, i, htmlSnapshot, zipBlob, objectURL, downloadId, zipFilename;
+
+    try {
+        // 检查 JSZip 是否可用
+        if (typeof JSZip === 'undefined') {
+            throw new Error('JSZip 库未加载');
+        }
+
+        setStatus("正在打包...");
+
+        // 创建 ZIP 对象
+        zip = new JSZip();
+
+        // 添加 HTML 文件
+        for (i = 0; i < htmlSnapshots.length; i++) {
+            htmlSnapshot = htmlSnapshots[i];
+            if (htmlSnapshot && htmlSnapshot.html) {
+                // 使用原始文件名
+                zip.file(htmlSnapshot.filename, htmlSnapshot.html);
+                setStatus("正在打包第 " + (i+1) + " / " + htmlSnapshots.length + " 份快照...");
+            }
+        }
+
+        // 生成 ZIP 文件
+        setStatus("正在生成ZIP文件...");
+        zipBlob = await zip.generateAsync({ type: "blob" });
+
+        // 生成文件名
+        zipFilename = folder ? (folder + "/capture-" + new Date().toISOString().replace(/[:.]/g, "-") + ".zip") : "capture-" + new Date().toISOString().replace(/[:.]/g, "-") + ".zip";
+
+        // 创建下载
+        objectURL = URL.createObjectURL(zipBlob);
+        downloadId = await chrome.downloads.download({
+            url: objectURL,
+            filename: zipFilename,
+            saveAs: false
+        });
+
+        await waitForDownload(downloadId);
+        URL.revokeObjectURL(objectURL);
+
+        return { success: true, downloadId: downloadId };
+    } catch (e) {
+        console.error("打包下载失败:", e);
+        throw e;
+    }
+}
+
 
 async function sendRuntimeMessage(message)
 {
     var response;
-    
+
     response = await chrome.runtime.sendMessage(message);
-    
+
     if (!response) throw new Error("扩展运行时没有返回响应。");
-    
+
     return response;
 }
 
@@ -629,4 +783,100 @@ function stopStatusPolling()
 function setStatus(text)
 {
     document.getElementById("status").textContent = text;
+}
+
+/************************************************************************/
+
+/* Network monitoring functions */
+
+async function handleNetworkCheckboxChange()
+{
+    var checkbox,tab;
+
+    checkbox = document.getElementById("capture-network-checkbox");
+
+    if (isGloballyListening && checkbox.checked && !isNetworkRecording) {
+        // 如果已经在监听HTML，且用户勾选了接口抓取，则开始网络录制
+        try {
+            tab = await getTargetTab();
+            await startNetworkRecordingInternal(tab);
+        } catch (e) {
+            console.error("[Network Monitor] handleNetworkCheckboxChange 开启网络录制失败:", e);
+        }
+    } else if (!checkbox.checked && isNetworkRecording) {
+        // 如果用户取消勾选，则停止网络录制
+        stopNetworkRecordingInternal();
+    }
+
+    refreshStatus();
+}
+
+async function startNetworkRecordingInternal(tab)
+{
+    var response;
+
+    try {
+        if (!tab) {
+            setStatus("开启网络录制失败: 缺少目标Tab");
+            return;
+        }
+
+        // 确保不是扩展页面
+        if (tab.url && tab.url.startsWith("chrome-extension://")) {
+            setStatus("开启网络录制失败: 不能对扩展页面录制");
+            return;
+        }
+
+        response = await sendRuntimeMessage({
+            type: "startNetworkRecording",
+            tabId: tab.id
+        });
+
+        if (response && response.error) {
+            throw new Error(response.message);
+        }
+
+        isNetworkRecording = true;
+        console.log("[Network Monitor] 网络录制已开启");
+        setStatus("网络录制已开启");
+    } catch (e) {
+        console.error("[Network Monitor] 开启网络录制失败:", e);
+        setStatus("开启网络录制失败: " + e.message);
+        isNetworkRecording = false;
+    }
+}
+
+async function stopNetworkRecordingInternal()
+{
+    var response;
+
+    try {
+        response = await sendRuntimeMessage({ type: "stopNetworkRecording" });
+
+        if (response && response.error) {
+            console.error("[Network Monitor] 停止网络录制失败:", response.message);
+        } else {
+            isNetworkRecording = false;
+        }
+    } catch (e) {
+        console.error("[Network Monitor] 停止网络录制失败:", e);
+    }
+}
+
+async function exportHarFile()
+{
+    var response;
+
+    try {
+        setStatus("正在导出HAR文件...");
+        response = await sendRuntimeMessage({ type: "exportHar" });
+
+        if (response && !response.error) {
+            setStatus(response.message);
+        } else {
+            setStatus("导出HAR失败: " + (response?.message || "未知错误"));
+        }
+    } catch (e) {
+        setStatus("导出HAR失败: " + e.message);
+    }
 }

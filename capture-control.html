@@ -54,12 +54,19 @@ button {
 <label for="limit-input">缓存上限（MB）</label>
 <input id="limit-input" type="number" min="10" max="2048" step="1" placeholder="10" style="width:100%;margin-top:6px;padding:8px 10px;box-sizing:border-box;">
 </p>
+<p>
+<label style="display:flex;align-items:center;cursor:pointer;">
+<input id="capture-network-checkbox" type="checkbox" style="margin-right:8px;">
+同时抓取接口（HAR格式）
+</label>
+</p>
 <button id="save-settings-button" type="button">保存设置</button>
 <button id="start-button" type="button">开始监听</button>
 <button id="stop-button" type="button">停止监听并保存</button>
 <button id="clear-button" type="button">清空缓存快照</button>
 <p id="status">加载中...</p>
 </main>
+<script src="jszip.min.js"></script>
 <script src="capture-control.js"></script>
 </body>
 </html>
