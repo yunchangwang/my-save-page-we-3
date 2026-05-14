@@ -32,22 +32,46 @@ capture-2026-05-14T10-30-00-123Z.zip
 - 大小：95KB（min版本）
 - 无外部依赖
 
+### 数据传递方案
+- **IndexedDB 中转** - 完全避开消息大小限制，支持超大文件
+- 在 background.js 中将 HAR 数据存储到 IndexedDB
+- 在 capture-control.js 中从 IndexedDB 读取数据
+- 使用完毕后自动清理 IndexedDB
+
 ### 代码修改
 
 1. **capture-control.html**
    - 引入 `jszip.min.js`
 
 2. **capture-control.js**
-   - 新增 `downloadAsZip()` 函数 - ZIP打包下载
-   - 修改 `stopListeningAndSave()` - 使用打包逻辑
+   - 新增 `downloadAsZip(htmlSnapshots, harData, folder)` 函数 - ZIP打包下载，支持HAR数据
+   - 新增 `getHarFromIndexedDB()` 函数 - 从IndexedDB读取HAR数据
+   - 新增 `clearHarFromIndexedDB()` 函数 - 清理IndexedDB中的HAR数据
+   - 修改 `stopListeningAndSave()` - 使用IndexedDB获取HAR数据并打包
    - 保留原有的 `downloadSnapshot()` 函数 - 单独下载（备用）
 
 3. **background.js**
-   - 新增 `getNetworkRecordings` 消息处理
-   - 新增 `buildHar` 消息处理
+   - 新增 `storeHarInIndexedDB` 消息处理 - 将HAR数据存储到IndexedDB
+   - 新增 `exportHar` 消息处理 - 单独导出HAR文件（可选功能）
 
 4. **jszip.min.js**
    - 新增文件，JSZip库
+
+### IndexedDB vs 其他方案对比
+
+| 方案 | 大小限制 | Service Worker支持 | 性能 | 复杂度 |
+|------|---------|------------------|------|--------|
+| IndexedDB | 无限制（数百MB） | ✅ 完全支持 | ⭐⭐⭐⭐ | 中 |
+| Blob URL | 无限制 | ❌ 不支持 | ⭐⭐⭐⭐ | 低 |
+| Data URL | ~2GB | ✅ 支持 | ⭐⭐⭐ | 低 |
+| Message Passing | 64MB | ✅ 支持 | ⭐⭐ | 低 |
+
+**选择 IndexedDB 的原因**：
+- ✅ 在 Service Worker 环境中完全支持
+- ✅ 无大小限制，支持超大HAR文件
+- ✅ 持久化存储，跨上下文访问
+- ✅ 事务性操作，数据安全
+- ✅ 自动清理，不占用额外空间
 
 ## 优势
 

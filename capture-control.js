@@ -103,27 +103,27 @@ async function stopListeningAndSave()
                 console.log("[DEBUG] 网络录制已停止");
             }
 
-            // 获取网络录制状态并导出HAR
+            // 获取网络录制状态并收集HAR数据
             try {
                 networkStatus = await sendRuntimeMessage({ type: "getNetworkStatus" });
 
                 if (networkStatus && networkStatus.totalEntryCount > 0) {
-                    setStatus("正在导出HAR文件...");
+                    setStatus("正在获取HAR数据...");
 
-                    // 直接在 background.js 中构建和导出 HAR，避免大数据传递
-                    const folder = sanitizeAutoCaptureFolder(document.getElementById("folder-input").value.trim());
-                    const harResponse = await sendRuntimeMessage({
-                        type: "exportHar",
-                        folder: folder
-                    });
+                    // 将 HAR 数据存储到 IndexedDB
+                    const storeResponse = await sendRuntimeMessage({ type: "storeHarInIndexedDB" });
 
-                    if (harResponse && !harResponse.error) {
-                        console.log("[Network Monitor] HAR文件已导出");
-                        setStatus("HAR文件已导出");
+                    if (storeResponse && !storeResponse.error) {
+                        console.log("[Network Monitor] 正在从 IndexedDB 读取 HAR 数据...");
+
+                        // 从 IndexedDB 读取数据
+                        harData = await getHarFromIndexedDB();
+
+                        console.log("[Network Monitor] HAR 数据读取成功，长度:", harData.length);
                     }
                 }
             } catch (e) {
-                console.error("[Network Monitor] 导出HAR失败:", e);
+                console.error("[Network Monitor] 获取HAR数据失败:", e);
             }
         } else {
             console.log("[DEBUG] 未勾选接口抓取复选框，跳过HAR数据收集");
@@ -156,10 +156,10 @@ async function stopListeningAndSave()
             }
         }
 
-        // 打包下载
+        // 打包下载（包含HAR数据）
         setStatus("正在打包下载...");
         const folder = sanitizeAutoCaptureFolder(document.getElementById("folder-input").value.trim());
-        await downloadAsZip(htmlSnapshots, folder);
+        await downloadAsZip(htmlSnapshots, harData, folder);
 
         // 清理数据
         await sendRuntimeMessage({ type: "clearAutoCaptureSnapshots", tabid: tab.id });
@@ -167,6 +167,7 @@ async function stopListeningAndSave()
 
         if (harData) {
             await sendRuntimeMessage({ type: "clearNetworkRecordings" });
+            await clearHarFromIndexedDB();  // 清理 IndexedDB 中的 HAR 数据
         }
 
         var statusMessage = "已打包下载 " + htmlSnapshots.length + " 份快照";
@@ -407,7 +408,7 @@ async function downloadSnapshot(htmltext,filename)
     URL.revokeObjectURL(objectURL);
 }
 
-async function downloadAsZip(htmlSnapshots, folder)
+async function downloadAsZip(htmlSnapshots, harData, folder)
 {
     var zip, filename, i, htmlSnapshot, zipBlob, objectURL, downloadId, zipFilename;
 
@@ -430,6 +431,13 @@ async function downloadAsZip(htmlSnapshots, folder)
                 zip.file(htmlSnapshot.filename, htmlSnapshot.html);
                 setStatus("正在打包第 " + (i+1) + " / " + htmlSnapshots.length + " 份快照...");
             }
+        }
+
+        // 添加 HAR 文件（如果存在）
+        if (harData) {
+            const harFilename = "network-" + new Date().toISOString().replace(/[:.]/g, "-") + ".har";
+            zip.file(harFilename, harData);
+            setStatus("已添加HAR文件到ZIP");
         }
 
         // 生成 ZIP 文件
@@ -878,5 +886,88 @@ async function exportHarFile()
         }
     } catch (e) {
         setStatus("导出HAR失败: " + e.message);
+    }
+}
+
+/************************************************************************/
+
+/* IndexedDB functions for HAR data transfer */
+
+async function getHarFromIndexedDB()
+{
+    const dbName = "SavePageWE_HAR";
+    const storeName = "harData";
+
+    try {
+        // 打开数据库
+        const request = indexedDB.open(dbName, 1);
+        const db = await new Promise((resolve, reject) => {
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve(request.result);
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains(storeName)) {
+                    db.createObjectStore(storeName);
+                }
+            };
+        });
+
+        // 读取数据
+        const transaction = db.transaction([storeName], "readonly");
+        const store = transaction.objectStore(storeName);
+        const getRequest = store.get("currentHar");
+
+        const harString = await new Promise((resolve, reject) => {
+            getRequest.onerror = () => reject(getRequest.error);
+            getRequest.onsuccess = () => resolve(getRequest.result);
+        });
+
+        db.close();
+
+        if (!harString) {
+            throw new Error("IndexedDB 中没有 HAR 数据");
+        }
+
+        return harString;
+    } catch (e) {
+        console.error("[IndexedDB] 读取 HAR 数据失败:", e);
+        throw e;
+    }
+}
+
+async function clearHarFromIndexedDB()
+{
+    const dbName = "SavePageWE_HAR";
+    const storeName = "harData";
+
+    try {
+        // 打开数据库
+        const request = indexedDB.open(dbName, 1);
+        const db = await new Promise((resolve, reject) => {
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve(request.result);
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains(storeName)) {
+                    db.createObjectStore(storeName);
+                }
+            };
+        });
+
+        // 删除数据
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        const deleteRequest = store.delete("currentHar");
+
+        await new Promise((resolve, reject) => {
+            deleteRequest.onerror = () => reject(deleteRequest.error);
+            deleteRequest.onsuccess = () => resolve();
+        });
+
+        db.close();
+
+        console.log("[IndexedDB] HAR 数据已清理");
+    } catch (e) {
+        console.error("[IndexedDB] 清理 HAR 数据失败:", e);
     }
 }

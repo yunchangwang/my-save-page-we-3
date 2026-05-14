@@ -1017,6 +1017,63 @@ function(message,sender,sendResponse)
         return true;
     }
 
+    if (message.type === "storeHarInIndexedDB") {
+        console.log("[DEBUG BG] storeHarInIndexedDB 被调用");
+
+        (async function() {
+            try {
+                const completedRecordings = networkMonitor.getCompletedRecordings();
+
+                if (completedRecordings.length === 0) {
+                    sendResponse({ error: true, message: "没有录制数据" });
+                    return;
+                }
+
+                const har = buildMergedHar(completedRecordings);
+                const harString = JSON.stringify(har, null, 2);
+
+                console.log("[DEBUG BG] HAR 数据大小:", harString.length, "字符");
+
+                // 存储到 IndexedDB
+                const dbName = "SavePageWE_HAR";
+                const storeName = "harData";
+
+                // 打开数据库
+                const request = indexedDB.open(dbName, 1);
+                const db = await new Promise((resolve, reject) => {
+                    request.onerror = () => reject(request.error);
+                    request.onsuccess = () => resolve(request.result);
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        if (!db.objectStoreNames.contains(storeName)) {
+                            db.createObjectStore(storeName);
+                        }
+                    };
+                });
+
+                // 存储数据
+                const transaction = db.transaction([storeName], "readwrite");
+                const store = transaction.objectStore(storeName);
+                const putRequest = store.put(harString, "currentHar");
+
+                await new Promise((resolve, reject) => {
+                    putRequest.onerror = () => reject(putRequest.error);
+                    putRequest.onsuccess = () => resolve();
+                });
+
+                db.close();
+
+                console.log("[DEBUG BG] HAR 数据已存储到 IndexedDB");
+                sendResponse({ success: true });
+            } catch (error) {
+                console.error("[DEBUG BG] storeHarInIndexedDB 错误:", error);
+                sendResponse({ error: true, message: error.message || String(error) });
+            }
+        })();
+
+        return true;
+    }
+
     // 其他消息继续使用原有的逻辑
     chrome.storage.local.get(null,
     function(local)
