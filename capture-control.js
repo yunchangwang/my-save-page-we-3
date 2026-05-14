@@ -129,8 +129,8 @@ async function stopListeningAndSave()
             console.log("[DEBUG] 未勾选接口抓取复选框，跳过HAR数据收集");
         }
 
-        // 收集所有HTML快照
-        snapshots = await getSnapshotList(tab.id);
+        // 收集所有HTML快照（按窗口收集，包含该窗口内所有tab的快照）
+        snapshots = await getSnapshotListByWindow(targetWindowId);
 
         if (snapshots.length == 0)
         {
@@ -144,7 +144,7 @@ async function stopListeningAndSave()
         for (i = 0; i < snapshots.length; i++)
         {
             snapshot = snapshots[i];
-            content = await sendRuntimeMessage({ type: "getAutoCaptureSnapshotHtml", tabid: tab.id, id: snapshot.id });
+            content = await sendRuntimeMessage({ type: "getAutoCaptureSnapshotHtml", tabid: snapshot.tabid, id: snapshot.id });
 
             if (content && content.html)
             {
@@ -161,8 +161,8 @@ async function stopListeningAndSave()
         const folder = sanitizeAutoCaptureFolder(document.getElementById("folder-input").value.trim());
         await downloadAsZip(htmlSnapshots, harData, folder);
 
-        // 清理数据
-        await sendRuntimeMessage({ type: "clearAutoCaptureSnapshots", tabid: tab.id });
+        // 清理数据（按窗口清理，清理该窗口内所有tab的快照）
+        await sendRuntimeMessage({ type: "clearAutoCaptureSnapshotsByWindow", windowid: targetWindowId });
         await sendTabMessage(tab.id,{ type: "resetAutoCaptureStorageState" });
 
         if (harData) {
@@ -220,7 +220,7 @@ async function clearBufferedSnapshots()
             }
         }
 
-        await sendRuntimeMessage({ type: "clearAutoCaptureSnapshots", tabid: tab.id });
+        await sendRuntimeMessage({ type: "clearAutoCaptureSnapshotsByWindow", windowid: targetWindowId });
         await sendTabMessage(tab.id,{ type: "resetAutoCaptureStorageState" });
 
         setStatus("缓存快照已清空。");
@@ -299,11 +299,19 @@ async function refreshStatus()
 async function loadSettings()
 {
     var local;
-    
+
     local = await chrome.storage.local.get([ "options-autocapturefolder", "options-autocapturelimitmb" ]);
-    
+
+    // 如果存储的值是旧的默认值10，自动更新为新的默认值100
+    var limitValue = local["options-autocapturelimitmb"];
+    if (limitValue === undefined || limitValue === 10) {
+        limitValue = 100;
+        // 自动保存新的默认值
+        await chrome.storage.local.set({ "options-autocapturelimitmb": 100 });
+    }
+
     document.getElementById("folder-input").value = local["options-autocapturefolder"] || "";
-    document.getElementById("limit-input").value = local["options-autocapturelimitmb"] || 10;
+    document.getElementById("limit-input").value = limitValue;
 }
 
 async function saveSettings()
@@ -328,11 +336,22 @@ async function saveSettings()
 async function getSnapshotList(tabId)
 {
     var response;
-    
+
     response = await sendRuntimeMessage({ type: "getAutoCaptureSnapshotList", tabid: tabId });
-    
+
     if (!response || !response.snapshots) return [];
-    
+
+    return response.snapshots;
+}
+
+async function getSnapshotListByWindow(windowId)
+{
+    var response;
+
+    response = await sendRuntimeMessage({ type: "getAutoCaptureSnapshotListByWindow", windowid: windowId });
+
+    if (!response || !response.snapshots) return [];
+
     return response.snapshots;
 }
 

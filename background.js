@@ -66,7 +66,7 @@ import { buildMergedHar } from "./har.js";
 
 var autoCaptureDBPromise = null;
 var autoCaptureDBName = "savepagewe-autocapture";
-var autoCaptureDBVersion = 1;
+var autoCaptureDBVersion = 2;  // 升级版本号以添加 windowId 索引
 var autoCaptureSnapshotStore = "snapshots";
 var autoCaptureMetaStore = "meta";
 var autoCaptureMetaTotalBytesKey = "totalbytes";
@@ -1074,6 +1074,17 @@ function(message,sender,sendResponse)
         return true;
     }
 
+    // 处理自动抓取相关的消息（不依赖storage，需要异步处理）
+    if (message.type === "getAutoCaptureSnapshotListByWindow") {
+        getAutoCaptureSnapshotListByWindow(message.windowid, sendResponse);
+        return true;
+    }
+
+    if (message.type === "clearAutoCaptureSnapshotsByWindow") {
+        clearAutoCaptureSnapshotsByWindow(message.windowid, sendResponse);
+        return true;
+    }
+
     // 其他消息继续使用原有的逻辑
     chrome.storage.local.get(null,
     function(local)
@@ -1164,9 +1175,9 @@ function(message,sender,sendResponse)
                 return true;  /* asynchronous response */
 
             case "storeAutoCaptureSnapshot":
-                
-                storeAutoCaptureSnapshot(sender.tab.id,message,local,sendResponse);
-                
+
+                storeAutoCaptureSnapshot(sender.tab.id, sender.tab.windowId, message, local, sendResponse);
+
                 return true;  /* asynchronous response */
                 
             case "getAutoCaptureStorageState":
@@ -1176,11 +1187,11 @@ function(message,sender,sendResponse)
                 return true;  /* asynchronous response */
                 
             case "getAutoCaptureSnapshotList":
-                
+
                 getAutoCaptureSnapshotList(message.tabid,sendResponse);
-                
+
                 return true;  /* asynchronous response */
-                
+
             case "getAutoCaptureSnapshotHtml":
                 
                 getAutoCaptureSnapshotHtml(message.tabid,message.id,sendResponse);
@@ -1188,11 +1199,11 @@ function(message,sender,sendResponse)
                 return true;  /* asynchronous response */
                 
             case "clearAutoCaptureSnapshots":
-                
+
                 clearAutoCaptureSnapshots(message.tabid,sendResponse);
-                
+
                 return true;  /* asynchronous response */
-                
+
             case "loadResource":
                 
                 chrome.tabs.get(sender.tab.id,
@@ -1902,15 +1913,24 @@ async function openAutoCaptureDB()
             request.onupgradeneeded = function()
             {
                 var db,store;
-                
+
                 db = request.result;
-                
+
                 if (!db.objectStoreNames.contains(autoCaptureSnapshotStore))
                 {
                     store = db.createObjectStore(autoCaptureSnapshotStore,{ keyPath: "id", autoIncrement: true });
                     store.createIndex("tabid","tabid",{ unique: false });
+                    store.createIndex("windowid","windowid",{ unique: false });  // 新增 windowId 索引
                 }
-                
+                else
+                {
+                    // 升级现有数据库，添加 windowId 索引
+                    store = request.transaction.objectStore(autoCaptureSnapshotStore);
+                    if (!store.indexNames.contains("windowid")) {
+                        store.createIndex("windowid","windowid",{ unique: false });
+                    }
+                }
+
                 if (!db.objectStoreNames.contains(autoCaptureMetaStore))
                 {
                     db.createObjectStore(autoCaptureMetaStore,{ keyPath: "key" });
@@ -2037,7 +2057,63 @@ async function autoCaptureGetSnapshotSummaries(tabId)
     await autoCaptureTransactionDone(transaction);
     
     summaries.sort(function(a,b) { return a.id-b.id; });
-    
+
+    return summaries;
+}
+
+async function autoCaptureGetSnapshotSummariesByWindow(windowId)
+{
+    var db,transaction,store,index,summaries;
+
+    db = await openAutoCaptureDB();
+    transaction = db.transaction([ autoCaptureSnapshotStore ],"readonly");
+    store = transaction.objectStore(autoCaptureSnapshotStore);
+    index = store.index("windowid");
+    summaries = [];
+
+    await new Promise(function(resolve,reject)
+    {
+        var request;
+
+        request = index.openCursor(IDBKeyRange.only(windowId));
+
+        request.onsuccess = function(event)
+        {
+            var cursor,value;
+
+            cursor = event.target.result;
+
+            if (cursor == null)
+            {
+                resolve();
+                return;
+            }
+
+            value = cursor.value;
+
+            summaries.push({
+                id: value.id,
+                tabid: value.tabid,
+                filename: value.filename,
+                capturedat: value.capturedat,
+                title: value.title,
+                url: value.url,
+                size: value.size
+            });
+
+            cursor.continue();
+        };
+
+        request.onerror = function()
+        {
+            reject(request.error || new Error("Failed to read auto capture snapshots by window."));
+        };
+    });
+
+    await autoCaptureTransactionDone(transaction);
+
+    summaries.sort(function(a,b) { return a.id-b.id; });
+
     return summaries;
 }
 
@@ -2046,29 +2122,30 @@ async function autoCaptureEstimateBytes(html)
     return (new Blob([ html ],{ type: "text/html" })).size;
 }
 
-async function storeAutoCaptureSnapshot(tabId,message,local,sendResponse)
+async function storeAutoCaptureSnapshot(tabId, windowId, message, local, sendResponse)
 {
     var db,transaction,snapshotStore,metaStore,totalbytes,limitbytes,size,record,addRequest,countRequest,snapshotcount;
-    
+
     try
     {
         db = await openAutoCaptureDB();
         totalbytes = await autoCaptureGetTotalBytes();
         limitbytes = Math.max(10,+(local["options-autocapturelimitmb"] || 10))*1024*1024;
         size = await autoCaptureEstimateBytes(message.html || "");
-        
+
         if (totalbytes + size > limitbytes)
         {
             sendResponse({ stored: false, reason: "limit", totalbytes: totalbytes, limitbytes: limitbytes });
             return;
         }
-        
+
         transaction = db.transaction([ autoCaptureSnapshotStore,autoCaptureMetaStore ],"readwrite");
         snapshotStore = transaction.objectStore(autoCaptureSnapshotStore);
         metaStore = transaction.objectStore(autoCaptureMetaStore);
-        
+
         record = {
             tabid: tabId,
+            windowid: windowId,  // 新增 windowId 字段
             filename: message.filename,
             html: message.html,
             url: message.url,
@@ -2127,6 +2204,18 @@ async function getAutoCaptureSnapshotList(tabId,sendResponse)
     try
     {
         sendResponse({ snapshots: await autoCaptureGetSnapshotSummaries(tabId) });
+    }
+    catch (e)
+    {
+        sendResponse({ snapshots: [], error: e.message });
+    }
+}
+
+async function getAutoCaptureSnapshotListByWindow(windowId,sendResponse)
+{
+    try
+    {
+        sendResponse({ snapshots: await autoCaptureGetSnapshotSummariesByWindow(windowId) });
     }
     catch (e)
     {
@@ -2207,6 +2296,65 @@ async function clearAutoCaptureSnapshots(tabId,sendResponse)
         
         await autoCaptureTransactionDone(transaction);
         
+        sendResponse({ cleared: true, snapshotcount: 0, totalbytes: totalbytes, removed: snapshots.length });
+    }
+    catch (e)
+    {
+        sendResponse({ cleared: false, error: e.message });
+    }
+}
+
+async function clearAutoCaptureSnapshotsByWindow(windowId,sendResponse)
+{
+    var db,transaction,snapshotStore,metaStore,index,totalbytes,removedbytes,snapshots;
+
+    try
+    {
+        db = await openAutoCaptureDB();
+        snapshots = await autoCaptureGetSnapshotSummariesByWindow(windowId);
+        totalbytes = await autoCaptureGetTotalBytes();
+        removedbytes = 0;
+
+        transaction = db.transaction([ autoCaptureSnapshotStore,autoCaptureMetaStore ],"readwrite");
+        snapshotStore = transaction.objectStore(autoCaptureSnapshotStore);
+        metaStore = transaction.objectStore(autoCaptureMetaStore);
+        index = snapshotStore.index("windowid");
+
+        await new Promise(function(resolve,reject)
+        {
+            var request;
+
+            request = index.openCursor(IDBKeyRange.only(windowId));
+
+            request.onsuccess = function(event)
+            {
+                var cursor,value;
+
+                cursor = event.target.result;
+
+                if (cursor == null)
+                {
+                    resolve();
+                    return;
+                }
+
+                value = cursor.value;
+                removedbytes += value.size || 0;
+                cursor.delete();
+                cursor.continue();
+            };
+
+            request.onerror = function()
+            {
+                reject(request.error || new Error("Failed to clear auto capture snapshots by window."));
+            };
+        });
+
+        totalbytes = Math.max(0,totalbytes-removedbytes);
+        metaStore.put({ key: autoCaptureMetaTotalBytesKey, value: totalbytes });
+
+        await autoCaptureTransactionDone(transaction);
+
         sendResponse({ cleared: true, snapshotcount: 0, totalbytes: totalbytes, removed: snapshots.length });
     }
     catch (e)
